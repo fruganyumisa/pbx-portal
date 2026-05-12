@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import os
 from datetime import datetime
 
@@ -62,6 +63,65 @@ class CdrRepository:
         calls = self.fetch_calls(start=start, end=end, queue=queue, agent=agent)
         return [_call_register_row(call) for call in calls[:limit]]
 
+    def fetch_call_page(self, start, end, queue=None, agent=None, source=None, direction=None, status=None, page=1, per_page=50):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("Install psycopg to connect to Postgres: pip install psycopg[binary]") from exc
+
+        ensure_portal_schema(self.database_url)
+        page = max(int(page or 1), 1)
+        per_page = min(max(int(per_page or 50), 1), 200)
+        where, params = _cdr_filters(start=start, end=end, queue=queue, agent=agent)
+        data_sql = f"""
+            SELECT calldate, src, dst, dcontext, channel, dstchannel, disposition,
+                   duration, billsec, lastapp, lastdata
+            FROM cdr
+            WHERE {where}
+            ORDER BY calldate DESC
+            LIMIT 100000
+        """
+        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(data_sql, params)
+                calls = [_normalize_cdr(row) for row in cursor.fetchall()]
+
+        call_rows = [_call_register_row(call) for call in calls]
+        filtered = _filter_call_rows(call_rows, source=source, direction=direction, status=status)
+        total = len(filtered)
+        offset = (page - 1) * per_page
+        paged = filtered[offset: offset + per_page]
+
+        return {
+            "calls": paged,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "pages": (total + per_page - 1) // per_page if total else 0,
+            },
+        }
+
+    def fetch_agents(self):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("Install psycopg to connect to Postgres: pip install psycopg[binary]") from exc
+
+        ensure_portal_schema(self.database_url)
+        sql = """
+            SELECT extension, name, email, department, outbound_cid, voicemail,
+                   ringtimer, noanswer, enabled, last_seen_at
+            FROM agents
+            ORDER BY extension
+        """
+        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                return [dict(row) for row in cursor.fetchall()]
+
 
 class FreePbxCdrSource:
     def __init__(self, mysql_config=None):
@@ -69,21 +129,9 @@ class FreePbxCdrSource:
 
     @classmethod
     def from_env(cls):
-        host = os.getenv("PBX_DB_HOST")
-        user = os.getenv("PBX_DB_USER")
-        password = os.getenv("PBX_DB_PASSWORD")
-        database = os.getenv("PBX_DB_NAME", "asteriskcdrdb")
-        port = int(os.getenv("PBX_DB_PORT", "3306"))
-        if host and user:
-            return cls(
-                {
-                    "host": host,
-                    "port": port,
-                    "user": user,
-                    "password": password,
-                    "database": database,
-                }
-            )
+        config = _pbx_mysql_config(os.getenv("PBX_DB_NAME", "asteriskcdrdb"))
+        if config:
+            return cls(config)
         return cls()
 
     @property
@@ -119,6 +167,48 @@ class FreePbxCdrSource:
 
         calls = [_normalize_cdr(row) for row in rows]
         return calls
+
+
+class FreePbxAgentSource:
+    def __init__(self, mysql_config=None):
+        self.mysql_config = mysql_config
+
+    @classmethod
+    def from_env(cls):
+        config = _pbx_mysql_config(os.getenv("PBX_CONFIG_DB_NAME", "asterisk"))
+        if config:
+            return cls(config)
+        return cls()
+
+    @property
+    def configured(self):
+        return bool(self.mysql_config)
+
+    def fetch_agents(self):
+        if not self.mysql_config:
+            raise RuntimeError("FreePBX database settings are not configured")
+
+        try:
+            import pymysql
+        except ImportError as exc:
+            raise RuntimeError("Install PyMySQL to connect to FreePBX: pip install PyMySQL") from exc
+
+        sql = """
+            SELECT extension, name, voicemail, ringtimer, noanswer, outboundcid
+            FROM users
+            ORDER BY extension
+        """
+        with pymysql.connect(
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=5,
+            read_timeout=30,
+            **self.mysql_config,
+        ) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+
+        return [_normalize_agent(row) for row in rows if _extension(row.get("extension"))]
 
 
 class PortalCdrStore:
@@ -173,14 +263,121 @@ class PortalCdrStore:
 
         return {"received": len(rows), "stored": len(rows)}
 
+    def upsert_agents(self, agents):
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError("Install psycopg to connect to Postgres: pip install psycopg[binary]") from exc
 
-def sync_freepbx_to_portal(start, end):
-    source = FreePbxCdrSource.from_env()
+        ensure_portal_schema(self.database_url)
+        rows = [_agent_row(agent) for agent in agents]
+        if not rows:
+            return {"received": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+
+        sql = """
+            INSERT INTO agents (
+              extension, name, email, department, outbound_cid, voicemail,
+              ringtimer, noanswer, enabled, source_hash, last_seen_at
+            )
+            VALUES (
+              %(extension)s, %(name)s, %(email)s, %(department)s, %(outbound_cid)s,
+              %(voicemail)s, %(ringtimer)s, %(noanswer)s, %(enabled)s,
+              %(source_hash)s, NOW()
+            )
+            ON CONFLICT (extension) DO UPDATE SET
+              name = EXCLUDED.name,
+              email = EXCLUDED.email,
+              department = EXCLUDED.department,
+              outbound_cid = EXCLUDED.outbound_cid,
+              voicemail = EXCLUDED.voicemail,
+              ringtimer = EXCLUDED.ringtimer,
+              noanswer = EXCLUDED.noanswer,
+              enabled = EXCLUDED.enabled,
+              source_hash = EXCLUDED.source_hash,
+              last_seen_at = NOW(),
+              updated_at = NOW()
+            WHERE agents.source_hash IS DISTINCT FROM EXCLUDED.source_hash
+            RETURNING (xmax = 0) AS inserted
+        """
+        inserted = 0
+        updated = 0
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cursor:
+                for row in rows:
+                    cursor.execute(sql, row)
+                    result = cursor.fetchone()
+                    if not result:
+                        continue
+                    if result[0]:
+                        inserted += 1
+                    else:
+                        updated += 1
+            conn.commit()
+
+        changed = inserted + updated
+        return {
+            "received": len(rows),
+            "inserted": inserted,
+            "updated": updated,
+            "unchanged": len(rows) - changed,
+        }
+
+    def get_sync_timestamp(self, key):
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError("Install psycopg to connect to Postgres: pip install psycopg[binary]") from exc
+
+        ensure_portal_schema(self.database_url)
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT synced_at FROM sync_state WHERE sync_key = %s", (key,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+
+    def set_sync_timestamp(self, key, synced_at):
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError("Install psycopg to connect to Postgres: pip install psycopg[binary]") from exc
+
+        ensure_portal_schema(self.database_url)
+        sql = """
+            INSERT INTO sync_state (sync_key, synced_at, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (sync_key) DO UPDATE SET
+              synced_at = EXCLUDED.synced_at,
+              updated_at = NOW()
+        """
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (key, synced_at))
+            conn.commit()
+
+
+def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
+    cdr_source = FreePbxCdrSource.from_env()
+    agent_source = FreePbxAgentSource.from_env()
     store = PortalCdrStore.from_env()
-    calls = source.fetch_calls(start=start, end=end)
-    result = store.upsert_calls(calls)
-    result.update({"start": start.isoformat(), "end": end.isoformat()})
-    return result
+    end = end or datetime.utcnow()
+    last_cdr_sync = store.get_sync_timestamp("cdr")
+    cdr_start = start or last_cdr_sync or fallback_start
+    if not cdr_start:
+        raise RuntimeError("No previous CDR sync exists. Provide start or days for the first sync.")
+
+    agents = agent_source.fetch_agents()
+    calls = cdr_source.fetch_calls(start=cdr_start, end=end)
+    agent_result = store.upsert_agents(agents)
+    call_result = store.upsert_calls(calls)
+    store.set_sync_timestamp("cdr", end)
+    store.set_sync_timestamp("agents", end)
+    return {
+        "start": cdr_start.isoformat(),
+        "end": end.isoformat(),
+        "previous_cdr_sync": last_cdr_sync.isoformat() if last_cdr_sync else None,
+        "agents": agent_result,
+        "calls": call_result,
+    }
 
 
 class QueueLogRepository:
@@ -231,13 +428,16 @@ def _normalize_cdr(row):
     duration = int(row.get("duration") or 0)
     billsec = int(row.get("billsec") or 0)
     agent = _agent_from_channels(src, dst, channel, dstchannel)
-    direction = "outbound" if agent == src else "inbound"
+    direction = _direction(agent=agent, src=src, dst=dst, channel=channel, dstchannel=dstchannel)
+    source_display = agent if direction == "outbound" and agent != "unassigned" else src
 
     return {
         "calldate": calldate,
         "agent": agent,
         "src": src,
         "dst": dst,
+        "source_display": source_display,
+        "destination_display": dst,
         "dcontext": str(row.get("dcontext") or ""),
         "channel": channel,
         "dstchannel": dstchannel,
@@ -253,12 +453,63 @@ def _normalize_cdr(row):
     }
 
 
+def _normalize_agent(row):
+    extension = str(row.get("extension") or "").strip()
+    name = str(row.get("name") or "").strip()
+    return {
+        "extension": extension,
+        "name": name or extension,
+        "email": str(row.get("email") or "").strip(),
+        "department": str(row.get("department") or "").strip(),
+        "outbound_cid": str(row.get("outboundcid") or "").strip(),
+        "voicemail": str(row.get("voicemail") or "").strip(),
+        "ringtimer": _nullable_int(row.get("ringtimer")),
+        "noanswer": str(row.get("noanswer") or "").strip(),
+        "enabled": True,
+    }
+
+
 def _agent_from_channels(src, dst, channel, dstchannel):
     for value in (dstchannel, channel, dst, src):
         extension = _extension(value)
         if extension:
             return extension
     return "unassigned"
+
+
+def _cdr_filters(start, end, queue=None, agent=None):
+    clauses = ["calldate >= %(start)s", "calldate <= %(end)s"]
+    params = {"start": start, "end": end}
+    if agent:
+        clauses.append(
+            """
+            (
+                src = %(agent)s OR dst = %(agent)s OR
+                channel LIKE %(agent_like)s OR dstchannel LIKE %(agent_like)s
+            )
+            """
+        )
+        params["agent"] = agent
+        params["agent_like"] = f"%/{agent}-%"
+    if queue:
+        clauses.append("(lastdata ILIKE %(queue_like)s OR dcontext ILIKE %(queue_like)s)")
+        params["queue_like"] = f"%{queue}%"
+    return " AND ".join(clauses), params
+
+
+def _direction(agent, src, dst, channel, dstchannel):
+    if agent == "unassigned":
+        return "inbound"
+
+    origin_extension = _extension(channel)
+    destination_extension = _extension(dstchannel)
+    dialed_extension = _extension(dst)
+
+    if origin_extension == agent and destination_extension != agent:
+        return "outbound"
+    if src == agent and dialed_extension != agent:
+        return "outbound"
+    return "inbound"
 
 
 def _extension(value):
@@ -282,6 +533,37 @@ def _queue_timestamp(value):
         return datetime.fromtimestamp(int(value))
     except (TypeError, ValueError, OSError):
         return None
+
+
+def _agent_row(agent):
+    source_hash = _agent_source_hash(agent)
+    return {
+        "extension": agent["extension"],
+        "name": agent.get("name") or agent["extension"],
+        "email": agent.get("email") or "",
+        "department": agent.get("department") or "",
+        "outbound_cid": agent.get("outbound_cid") or "",
+        "voicemail": agent.get("voicemail") or "",
+        "ringtimer": agent.get("ringtimer"),
+        "noanswer": agent.get("noanswer") or "",
+        "enabled": bool(agent.get("enabled", True)),
+        "source_hash": source_hash,
+    }
+
+
+def _agent_source_hash(agent):
+    parts = [
+        agent.get("extension") or "",
+        agent.get("name") or "",
+        agent.get("email") or "",
+        agent.get("department") or "",
+        agent.get("outbound_cid") or "",
+        agent.get("voicemail") or "",
+        str(agent.get("ringtimer") or ""),
+        agent.get("noanswer") or "",
+        str(bool(agent.get("enabled", True))),
+    ]
+    return hashlib.md5("|".join(parts).encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def _portal_row(call):
@@ -311,8 +593,6 @@ def _source_uid(call):
         str(call.get("duration") or 0),
         str(call.get("billsec") or 0),
     ]
-    import hashlib
-
     return hashlib.md5("|".join(parts).encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
@@ -323,6 +603,7 @@ def ensure_portal_schema(database_url):
         raise RuntimeError("Install psycopg to connect to Postgres: pip install psycopg[binary]") from exc
 
     statements = [
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
         """
         CREATE TABLE IF NOT EXISTS cdr (
           id BIGSERIAL PRIMARY KEY,
@@ -346,6 +627,68 @@ def ensure_portal_schema(database_url):
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_cdr_source_uid ON cdr (source_uid)",
         "CREATE INDEX IF NOT EXISTS idx_cdr_calldate ON cdr (calldate)",
         "CREATE INDEX IF NOT EXISTS idx_cdr_src_dst ON cdr (src, dst)",
+        """
+        CREATE TABLE IF NOT EXISTS agents (
+          id BIGSERIAL PRIMARY KEY,
+          extension TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL DEFAULT '',
+          email TEXT NOT NULL DEFAULT '',
+          department TEXT NOT NULL DEFAULT '',
+          outbound_cid TEXT NOT NULL DEFAULT '',
+          voicemail TEXT NOT NULL DEFAULT '',
+          ringtimer INTEGER,
+          noanswer TEXT NOT NULL DEFAULT '',
+          enabled BOOLEAN NOT NULL DEFAULT TRUE,
+          source_hash TEXT NOT NULL DEFAULT '',
+          last_seen_at TIMESTAMP,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_extension ON agents (extension)",
+        """
+        CREATE TABLE IF NOT EXISTS sync_state (
+          sync_key TEXT PRIMARY KEY,
+          synced_at TIMESTAMP NOT NULL,
+          updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS portal_users (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          username TEXT NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+          full_name TEXT NOT NULL DEFAULT '',
+          enabled BOOLEAN NOT NULL DEFAULT TRUE,
+          last_login_at TIMESTAMP,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'portal_users'
+                  AND column_name = 'id'
+                  AND data_type <> 'uuid'
+            ) THEN
+                ALTER TABLE portal_users ADD COLUMN IF NOT EXISTS id_uuid UUID;
+                UPDATE portal_users SET id_uuid = gen_random_uuid() WHERE id_uuid IS NULL;
+                ALTER TABLE portal_users ALTER COLUMN id_uuid SET NOT NULL;
+                ALTER TABLE portal_users DROP CONSTRAINT IF EXISTS portal_users_pkey;
+                ALTER TABLE portal_users ADD CONSTRAINT portal_users_pkey PRIMARY KEY (id_uuid);
+                ALTER TABLE portal_users DROP COLUMN id;
+                ALTER TABLE portal_users RENAME COLUMN id_uuid TO id;
+                ALTER TABLE portal_users ALTER COLUMN id SET DEFAULT gen_random_uuid();
+            END IF;
+        END $$;
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_users_username ON portal_users (lower(username))",
     ]
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cursor:
@@ -369,11 +712,35 @@ def _database_url_from_env():
     return None
 
 
+def _pbx_mysql_config(database):
+    host = os.getenv("PBX_DB_HOST")
+    user = os.getenv("PBX_DB_USER")
+    password = os.getenv("PBX_DB_PASSWORD")
+    port = int(os.getenv("PBX_DB_PORT", "3306"))
+    if not host or not user:
+        return None
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "database": database,
+    }
+
+
+def _nullable_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _call_register_row(call):
     return {
         "time": call["calldate"].isoformat(),
-        "source": call["src"],
-        "destination": call["dst"],
+        "source": call.get("source_display") or call["src"],
+        "raw_source": call["src"],
+        "destination": call.get("destination_display") or call["dst"],
         "agent": call["agent"],
         "direction": call["direction"],
         "status": "Answered" if call["answered"] else call["disposition"].title() or "Unanswered",
@@ -383,3 +750,36 @@ def _call_register_row(call):
         "queue": call.get("queue"),
         "channel": call["channel"],
     }
+
+
+def _filter_call_rows(rows, source=None, direction=None, status=None):
+    filtered = rows
+
+    if source:
+        source_query = source.strip().lower()
+        filtered = [
+            row
+            for row in filtered
+            if source_query in str(row.get("source") or "").lower()
+            or source_query in str(row.get("raw_source") or "").lower()
+        ]
+
+    if direction:
+        direction_query = direction.strip().lower()
+        if direction_query in {"inbound", "outbound"}:
+            filtered = [row for row in filtered if str(row.get("direction") or "").lower() == direction_query]
+
+    if status:
+        status_query = status.strip().lower()
+        filtered = [row for row in filtered if _normalize_status(row.get("status")) == status_query]
+
+    return filtered
+
+
+def _normalize_status(value):
+    normalized = " ".join(str(value or "").strip().lower().split())
+    if normalized in {"cancel", "canceled", "cancelled"}:
+        return "canceled"
+    if normalized in {"no answer", "noanswer"}:
+        return "no answer"
+    return normalized

@@ -9,6 +9,7 @@ A lightweight FreePBX/Asterisk call-center performance dashboard. The backend im
 - Call register with timestamp, source, destination, status, duration, talk time, and ring time
 - Calls received, calls placed, calls hung before answer, failed or busy calls
 - Agent active time, talk time, idle time, occupancy, and pauses
+- Synced agent directory from FreePBX `users`
 - Top call sources and destinations
 - Call duration distribution
 - Inbound vs outbound call mix
@@ -35,9 +36,15 @@ cp .env.example .env
 docker compose up --build
 ```
 
+For background mode:
+
+```bash
+docker compose up --build -d
+```
+
 Services:
 
-- Postgres: `localhost:5432`
+- Postgres: internal Docker network only (not published to host)
 - Flask API: `http://localhost:5000`
 - Next.js frontend: `http://localhost:3000`
 
@@ -52,6 +59,37 @@ POSTGRES_PORT=5432
 ```
 
 Inside Docker, the backend uses `POSTGRES_HOST=db` and builds the portal database connection from the same Postgres credentials. You can still set `DATABASE_URL` explicitly if you need to override that behavior.
+
+### Production tuning with environment variables
+
+Backend runs with Gunicorn in Compose. These variables are available in `.env.example` for production tuning:
+
+```text
+BACKEND_BIND_HOST=127.0.0.1
+BACKEND_EXPOSE_PORT=5000
+FRONTEND_BIND_HOST=127.0.0.1
+FRONTEND_EXPOSE_PORT=3000
+
+GUNICORN_WORKERS=2
+GUNICORN_THREADS=4
+GUNICORN_TIMEOUT=120
+GUNICORN_GRACEFUL_TIMEOUT=30
+GUNICORN_KEEPALIVE=5
+GUNICORN_MAX_REQUESTS=1000
+GUNICORN_MAX_REQUESTS_JITTER=100
+
+SESSION_COOKIE_HTTPONLY=true
+SESSION_COOKIE_SAMESITE=Lax
+SESSION_COOKIE_SECURE=false
+TRUST_PROXY=false
+```
+
+For TLS-terminated deployments behind Nginx or a load balancer, set:
+
+```text
+SESSION_COOKIE_SECURE=true
+TRUST_PROXY=true
+```
 
 The portal does not seed demo CDR data. The dashboard remains empty until real PBX records are imported.
 
@@ -68,6 +106,22 @@ Then click `Sync PBX` in the dashboard or call:
 
 ```bash
 curl -X POST 'http://localhost:5000/api/sync?days=1'
+```
+
+Sync imports both CDR rows and agent records. The portal stores all imported history in Postgres, so old calls remain available for filtering after later syncs.
+
+CDR sync is incremental. The portal stores the last successful CDR sync time in `sync_state`; the next sync pulls only calls from that timestamp up to the current timestamp. On the first sync, provide an explicit `start` or let the default one-day bootstrap run:
+
+```bash
+curl -X POST 'http://localhost:5000/api/sync?start=2026-05-01T00:00:00&end=2026-05-11T18:30:00'
+```
+
+Agent records are read from the FreePBX configuration database `users` table, normally `asterisk.users`, and saved into the portal Postgres `agents` table. Repeated syncs are idempotent: new agents are inserted, changed agent details are updated, and unchanged synced agents remain stored in Postgres.
+
+The call register is paginated from Postgres:
+
+```bash
+curl 'http://localhost:5000/api/calls?start=2026-05-11T08:00:00&end=2026-05-11T18:30:00&page=1&per_page=50'
 ```
 
 To clear imported portal data and rebuild the database volume:
@@ -118,18 +172,20 @@ export PBX_DB_HOST=freepbx-host-or-ip
 export PBX_DB_USER=readonly_user
 export PBX_DB_PASSWORD='your-password'
 export PBX_DB_NAME=asteriskcdrdb
+export PBX_CONFIG_DB_NAME=asterisk
 export QUEUE_LOG_PATH=/var/log/asterisk/queue_log
 ```
 
-`POSTGRES_*` points to the portal Postgres database. `DATABASE_URL` can override those settings. `PBX_DB_*` points to the FreePBX MariaDB database that the sync process reads from.
+`POSTGRES_*` points to the portal Postgres database. `DATABASE_URL` can override those settings. `PBX_DB_*` points to the FreePBX CDR database, and `PBX_CONFIG_DB_NAME` points to the FreePBX configuration database containing `users`.
 
-Use a read-only MariaDB user for the PBX host. The app only needs `SELECT` access to `asteriskcdrdb.cdr`.
+Use a read-only MariaDB user for the PBX host. The app needs `SELECT` access to `asteriskcdrdb.cdr` and `asterisk.users`.
 
 Example SQL on the PBX database server:
 
 ```sql
 CREATE USER 'pbx_portal'@'%' IDENTIFIED BY 'strong-password';
 GRANT SELECT ON asteriskcdrdb.cdr TO 'pbx_portal'@'%';
+GRANT SELECT ON asterisk.users TO 'pbx_portal'@'%';
 FLUSH PRIVILEGES;
 ```
 
@@ -141,4 +197,4 @@ This version avoids paid FreePBX modules by using standard Asterisk/FreePBX arti
 - Portal store: `cdr` table in the bundled Postgres container
 - Optional local file source: `/var/log/asterisk/queue_log` for queue membership, pause, unpause, connect, and remove events
 
-For a production deployment, put the Flask app behind Nginx, enable authentication, and run it close to the PBX database or a read replica.
+For production, place the frontend/backend behind a reverse proxy (Nginx/Traefik), keep Postgres port bound to localhost or private network only, and run close to the PBX database or a read replica.

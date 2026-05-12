@@ -5,8 +5,10 @@ from datetime import datetime, timedelta
 def build_dashboard(cdr_repo, queue_repo, start, end, queue=None, agent=None):
     calls = cdr_repo.fetch_calls(start=start, end=end, queue=queue, agent=agent)
     queue_events = queue_repo.fetch_events(start=start, end=end, queue=queue, agent=agent)
+    agent_directory = cdr_repo.fetch_agents()
+    agent_lookup = {row["extension"]: row for row in agent_directory}
 
-    agents = _agent_metrics(calls, queue_events)
+    agents = _agent_metrics(calls, queue_events, agent_lookup)
     totals = _totals(calls, agents)
     summary = _call_summary(calls)
 
@@ -17,19 +19,21 @@ def build_dashboard(cdr_repo, queue_repo, start, end, queue=None, agent=None):
         "totals": totals,
         "summary": summary,
         "agents": sorted(agents, key=lambda row: row["efficiency_score"], reverse=True),
+        "agent_directory": agent_directory,
         "agent_activity": _agent_activity(agents),
         "trend": _daily_trend(calls, start, end),
         "duration_bands": _duration_bands(calls),
-        "top_sources": _top_values(calls, "src"),
-        "top_destinations": _top_values(calls, "dst"),
-        "recent_calls": [_call_register_row(call) for call in calls[:200]],
+        "top_sources": _top_values(calls, "source_display"),
+        "top_destinations": _top_values(calls, "destination_display"),
     }
 
 
-def _agent_metrics(calls, queue_events):
+def _agent_metrics(calls, queue_events, agent_lookup):
     grouped = defaultdict(list)
     for call in calls:
         if call["agent"] == "unassigned":
+            continue
+        if agent_lookup and call["agent"] not in agent_lookup:
             continue
         grouped[call["agent"]].append(call)
 
@@ -53,6 +57,8 @@ def _agent_metrics(calls, queue_events):
         rows.append(
             {
                 "agent": agent,
+                "agent_name": agent_lookup.get(agent, {}).get("name") or agent,
+                "agent_label": _agent_label(agent, agent_lookup),
                 "total_calls": total,
                 "answered_calls": len(answered_calls),
                 "missed_calls": missed,
@@ -148,6 +154,8 @@ def _agent_activity(agents):
     return [
         {
             "agent": row["agent"],
+            "agent_name": row["agent_name"],
+            "agent_label": row["agent_label"],
             "active_seconds": row["login_seconds"],
             "talk_seconds": row["talk_seconds"],
             "idle_seconds": max(row["login_seconds"] - row["talk_seconds"], 0),
@@ -187,8 +195,9 @@ def _top_values(calls, key, limit=8):
 def _call_register_row(call):
     return {
         "time": call["calldate"].isoformat(),
-        "source": call["src"],
-        "destination": call["dst"],
+        "source": call.get("source_display") or call["src"],
+        "raw_source": call["src"],
+        "destination": call.get("destination_display") or call["dst"],
         "agent": call["agent"],
         "direction": call["direction"],
         "status": _status(call),
@@ -197,6 +206,11 @@ def _call_register_row(call):
         "ring_seconds": call["ring_seconds"],
         "queue": call.get("queue"),
     }
+
+
+def _agent_label(extension, agent_lookup):
+    name = agent_lookup.get(extension, {}).get("name") or ""
+    return f"{name} ({extension})" if name and name != extension else extension
 
 
 def _status(call):

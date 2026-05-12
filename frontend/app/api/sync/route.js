@@ -5,6 +5,7 @@ export async function POST(request) {
   const url = new URL(request.url);
   const response = await fetch(`${backend}/api/sync?${url.searchParams.toString()}`, {
     method: "POST",
+    headers: { cookie: request.headers.get("cookie") || "" },
     cache: "no-store",
   });
   const data = await response.json();
