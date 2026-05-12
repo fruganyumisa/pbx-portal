@@ -192,7 +192,10 @@ def create_app():
         try:
             result = _run_sync(start=explicit_start, end=end, fallback_start=fallback_start)
         except RuntimeError as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        except Exception:
+            app.logger.exception("Sync failed unexpectedly")
+            return jsonify({"ok": False, "error": "Sync failed unexpectedly"}), 500
         return jsonify({"ok": True, **result})
 
     @app.get("/health")

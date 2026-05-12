@@ -173,6 +173,11 @@ export PBX_DB_USER=readonly_user
 export PBX_DB_PASSWORD='your-password'
 export PBX_DB_NAME=asteriskcdrdb
 export PBX_CONFIG_DB_NAME=asterisk
+export PBX_DB_CONNECT_TIMEOUT_SECONDS=10
+export PBX_DB_READ_TIMEOUT_SECONDS=180
+export PBX_DB_WRITE_TIMEOUT_SECONDS=30
+export PBX_DB_RETRY_ATTEMPTS=3
+export PBX_DB_RETRY_BASE_DELAY_SECONDS=2
 export QUEUE_LOG_PATH=/var/log/asterisk/queue_log
 ```
 

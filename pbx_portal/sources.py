@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import os
+import time
 from datetime import datetime
 
 
@@ -155,15 +156,13 @@ class FreePbxCdrSource:
             ORDER BY calldate DESC
             LIMIT 50000
         """
-        with pymysql.connect(
-            cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=5,
-            read_timeout=30,
-            **self.mysql_config,
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql, (start, end))
-                rows = cursor.fetchall()
+        def _read():
+            with pymysql.connect(**_pbx_mysql_connect_kwargs(pymysql), **self.mysql_config) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (start, end))
+                    return cursor.fetchall()
+
+        rows = _with_pbx_retry("CDR fetch", _read)
 
         calls = [_normalize_cdr(row) for row in rows]
         return calls
@@ -198,15 +197,13 @@ class FreePbxAgentSource:
             FROM users
             ORDER BY extension
         """
-        with pymysql.connect(
-            cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=5,
-            read_timeout=30,
-            **self.mysql_config,
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql)
-                rows = cursor.fetchall()
+        def _read():
+            with pymysql.connect(**_pbx_mysql_connect_kwargs(pymysql), **self.mysql_config) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql)
+                    return cursor.fetchall()
+
+        rows = _with_pbx_retry("agent fetch", _read)
 
         return [_normalize_agent(row) for row in rows if _extension(row.get("extension"))]
 
@@ -726,6 +723,53 @@ def _pbx_mysql_config(database):
         "password": password,
         "database": database,
     }
+
+
+def _pbx_mysql_connect_kwargs(pymysql_module):
+    return {
+        "cursorclass": pymysql_module.cursors.DictCursor,
+        "connect_timeout": _env_int("PBX_DB_CONNECT_TIMEOUT_SECONDS", 10),
+        "read_timeout": _env_int("PBX_DB_READ_TIMEOUT_SECONDS", 180),
+        "write_timeout": _env_int("PBX_DB_WRITE_TIMEOUT_SECONDS", 30),
+        "charset": "utf8mb4",
+        "autocommit": True,
+    }
+
+
+def _with_pbx_retry(operation, fn):
+    attempts = max(_env_int("PBX_DB_RETRY_ATTEMPTS", 3), 1)
+    base_delay = max(_env_float("PBX_DB_RETRY_BASE_DELAY_SECONDS", 2.0), 0.0)
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise RuntimeError("Install PyMySQL to connect to FreePBX: pip install PyMySQL") from exc
+
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except pymysql.MySQLError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            sleep_for = base_delay * (2 ** (attempt - 1))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    raise RuntimeError(f"PBX {operation} failed after {attempts} attempts: {last_error}")
+
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _nullable_int(value):

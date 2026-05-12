@@ -26,14 +26,12 @@ class AuthService:
         admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
         with self._connect() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT COUNT(*) FROM portal_users")
-                count = cursor.fetchone()[0]
-                if count:
-                    return
                 cursor.execute(
                     """
                     INSERT INTO portal_users (username, password_hash, role, full_name, enabled)
-                    VALUES (%s, %s, 'admin', %s, TRUE)
+                    SELECT %s, %s, 'admin', %s, TRUE
+                    WHERE NOT EXISTS (SELECT 1 FROM portal_users)
+                    ON CONFLICT (username) DO NOTHING
                     """,
                     (admin_username, generate_password_hash(admin_password), "Administrator"),
                 )
