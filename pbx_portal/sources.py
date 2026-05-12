@@ -2,7 +2,8 @@ import csv
 import hashlib
 import os
 import time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 
 
 class CdrRepository:
@@ -140,9 +141,64 @@ class FreePbxCdrSource:
         return bool(self.mysql_config)
 
     def fetch_calls(self, start, end):
+        calls = []
+        for chunk in self.iter_calls_chunked(start=start, end=end):
+            calls.extend(chunk)
+        return calls
+
+    def iter_calls_chunked(self, start, end):
         if not self.mysql_config:
             raise RuntimeError("FreePBX database settings are not configured")
+        if start >= end:
+            return
 
+        limit = max(_env_int("PBX_SYNC_QUERY_LIMIT", 5000), 100)
+        window_minutes = max(_env_int("PBX_SYNC_WINDOW_MINUTES", 60), 1)
+        min_window_seconds = max(_env_int("PBX_SYNC_MIN_WINDOW_SECONDS", 60), 1)
+        end_exclusive = end + timedelta(seconds=1)
+
+        windows = deque()
+        cursor = start
+        while cursor < end_exclusive:
+            next_cursor = min(cursor + timedelta(minutes=window_minutes), end_exclusive)
+            windows.append((cursor, next_cursor))
+            cursor = next_cursor
+
+        while windows:
+            window_start, window_end = windows.popleft()
+            probe_rows = self._fetch_calls_window_rows(
+                start=window_start,
+                end_exclusive=window_end,
+                limit=limit + 1,
+                offset=0,
+            )
+            if len(probe_rows) <= limit:
+                yield [_normalize_cdr(row) for row in probe_rows]
+                continue
+
+            if (window_end - window_start).total_seconds() > min_window_seconds:
+                midpoint = window_start + ((window_end - window_start) / 2)
+                if window_start < midpoint < window_end:
+                    windows.appendleft((midpoint, window_end))
+                    windows.appendleft((window_start, midpoint))
+                    continue
+
+            offset = 0
+            while True:
+                page_rows = self._fetch_calls_window_rows(
+                    start=window_start,
+                    end_exclusive=window_end,
+                    limit=limit,
+                    offset=offset,
+                )
+                if not page_rows:
+                    break
+                yield [_normalize_cdr(row) for row in page_rows]
+                if len(page_rows) < limit:
+                    break
+                offset += limit
+
+    def _fetch_calls_window_rows(self, start, end_exclusive, limit, offset):
         try:
             import pymysql
         except ImportError as exc:
@@ -152,20 +208,19 @@ class FreePbxCdrSource:
             SELECT calldate, src, dst, dcontext, channel, dstchannel, disposition,
                    duration, billsec, lastapp, lastdata
             FROM cdr
-            WHERE calldate >= %s AND calldate <= %s
-            ORDER BY calldate DESC
-            LIMIT 50000
+            WHERE calldate >= %s AND calldate < %s
+            ORDER BY calldate ASC, src ASC, dst ASC, channel ASC, dstchannel ASC,
+                     disposition ASC, duration ASC, billsec ASC
+            LIMIT %s OFFSET %s
         """
+
         def _read():
             with pymysql.connect(**_pbx_mysql_connect_kwargs(pymysql), **self.mysql_config) as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(sql, (start, end))
+                    cursor.execute(sql, (start, end_exclusive, int(limit), int(offset)))
                     return cursor.fetchall()
 
-        rows = _with_pbx_retry("CDR fetch", _read)
-
-        calls = [_normalize_cdr(row) for row in rows]
-        return calls
+        return _with_pbx_retry("CDR fetch", _read)
 
 
 class FreePbxAgentSource:
@@ -363,9 +418,15 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
         raise RuntimeError("No previous CDR sync exists. Provide start or days for the first sync.")
 
     agents = agent_source.fetch_agents()
-    calls = cdr_source.fetch_calls(start=cdr_start, end=end)
     agent_result = store.upsert_agents(agents)
-    call_result = store.upsert_calls(calls)
+    call_totals = {"received": 0, "stored": 0}
+    call_chunks = 0
+    for calls_chunk in cdr_source.iter_calls_chunked(start=cdr_start, end=end):
+        chunk_result = store.upsert_calls(calls_chunk)
+        call_totals["received"] += chunk_result["received"]
+        call_totals["stored"] += chunk_result["stored"]
+        call_chunks += 1
+
     store.set_sync_timestamp("cdr", end)
     store.set_sync_timestamp("agents", end)
     return {
@@ -373,7 +434,10 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
         "end": end.isoformat(),
         "previous_cdr_sync": last_cdr_sync.isoformat() if last_cdr_sync else None,
         "agents": agent_result,
-        "calls": call_result,
+        "calls": {
+            **call_totals,
+            "chunks": call_chunks,
+        },
     }
 
 

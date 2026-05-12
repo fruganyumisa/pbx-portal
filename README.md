@@ -110,6 +110,8 @@ curl -X POST 'http://localhost:5000/api/sync?days=1'
 
 Sync imports both CDR rows and agent records. The portal stores all imported history in Postgres, so old calls remain available for filtering after later syncs.
 
+CDR import is chunked by time window and query limit to handle large datasets without single long-running PBX queries.
+
 CDR sync is incremental. The portal stores the last successful CDR sync time in `sync_state`; the next sync pulls only calls from that timestamp up to the current timestamp. On the first sync, provide an explicit `start` or let the default one-day bootstrap run:
 
 ```bash
@@ -178,6 +180,9 @@ export PBX_DB_READ_TIMEOUT_SECONDS=180
 export PBX_DB_WRITE_TIMEOUT_SECONDS=30
 export PBX_DB_RETRY_ATTEMPTS=3
 export PBX_DB_RETRY_BASE_DELAY_SECONDS=2
+export PBX_SYNC_QUERY_LIMIT=5000
+export PBX_SYNC_WINDOW_MINUTES=60
+export PBX_SYNC_MIN_WINDOW_SECONDS=60
 export QUEUE_LOG_PATH=/var/log/asterisk/queue_log
 ```
 
