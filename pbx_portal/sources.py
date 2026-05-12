@@ -413,12 +413,32 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
     store = PortalCdrStore.from_env()
     end = end or datetime.utcnow()
     last_cdr_sync = store.get_sync_timestamp("cdr")
+    last_agent_sync = store.get_sync_timestamp("agents")
     cdr_start = start or last_cdr_sync or fallback_start
     if not cdr_start:
         raise RuntimeError("No previous CDR sync exists. Provide start or days for the first sync.")
 
-    agents = agent_source.fetch_agents()
-    agent_result = store.upsert_agents(agents)
+    warnings = []
+    agent_result = {
+        "received": 0,
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "synced": False,
+    }
+    try:
+        agents = agent_source.fetch_agents()
+        agent_result = {
+            **store.upsert_agents(agents),
+            "synced": True,
+        }
+    except Exception as exc:
+        warnings.append(str(exc))
+        agent_result = {
+            **agent_result,
+            "error": str(exc),
+        }
+
     call_totals = {"received": 0, "stored": 0}
     call_chunks = 0
     for calls_chunk in cdr_source.iter_calls_chunked(start=cdr_start, end=end):
@@ -428,16 +448,20 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
         call_chunks += 1
 
     store.set_sync_timestamp("cdr", end)
-    store.set_sync_timestamp("agents", end)
+    if agent_result["synced"]:
+        store.set_sync_timestamp("agents", end)
     return {
         "start": cdr_start.isoformat(),
         "end": end.isoformat(),
         "previous_cdr_sync": last_cdr_sync.isoformat() if last_cdr_sync else None,
+        "previous_agent_sync": last_agent_sync.isoformat() if last_agent_sync else None,
         "agents": agent_result,
         "calls": {
             **call_totals,
             "chunks": call_chunks,
         },
+        "partial": bool(warnings),
+        "warnings": warnings,
     }
 
 
