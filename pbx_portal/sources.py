@@ -7,9 +7,9 @@ from collections import deque
 from datetime import datetime, timedelta
 
 
-# Global connection pool for FreePBX MySQL connections
-_mysql_pool = None
-_mysql_pool_lock = threading.Lock()
+# Global connection pools for FreePBX MySQL databases (one per database)
+_mysql_pools = {}  # Dict of database -> pool
+_mysql_pools_lock = threading.Lock()
 
 
 class MySQLConnectionPool:
@@ -310,7 +310,7 @@ class FreePbxCdrSource:
             pool = _get_mysql_pool(self.mysql_config)
             conn = pool.get_connection(timeout=15)
             try:
-                cursor = conn.cursor()
+                cursor = conn.cursor(dictionary=True)
                 try:
                     cursor.execute(sql, (start, end_exclusive, int(limit), int(offset)))
                     return cursor.fetchall()
@@ -350,7 +350,7 @@ class FreePbxAgentSource:
             pool = _get_mysql_pool(self.mysql_config)
             conn = pool.get_connection(timeout=15)
             try:
-                cursor = conn.cursor()
+                cursor = conn.cursor(dictionary=True)
                 try:
                     cursor.execute(sql)
                     return cursor.fetchall()
@@ -899,20 +899,25 @@ def _database_url_from_env():
 
 
 def _get_mysql_pool(mysql_config):
-    """Get or create the global MySQL connection pool."""
-    global _mysql_pool
+    """Get or create a MySQL connection pool for the specific database."""
+    global _mysql_pools
     
-    if _mysql_pool is not None:
-        return _mysql_pool
+    # Use database name as the pool key
+    database = mysql_config.get('database', 'default')
     
-    with _mysql_pool_lock:
-        if _mysql_pool is not None:
-            return _mysql_pool
+    if database in _mysql_pools and _mysql_pools[database] is not None:
+        return _mysql_pools[database]
+    
+    with _mysql_pools_lock:
+        # Double-check after acquiring lock
+        if database in _mysql_pools and _mysql_pools[database] is not None:
+            return _mysql_pools[database]
         
         pool_size = max(_env_int("PBX_DB_POOL_SIZE", 5), 2)
         enhanced_config = {**mysql_config, **_pbx_mysql_connect_kwargs()}
-        _mysql_pool = MySQLConnectionPool(enhanced_config, pool_size=pool_size)
-        return _mysql_pool
+        pool = MySQLConnectionPool(enhanced_config, pool_size=pool_size, pool_name=f"pool_{database}")
+        _mysql_pools[database] = pool
+        return pool
 
 
 def _pbx_mysql_connect_kwargs():
