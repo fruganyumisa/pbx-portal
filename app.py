@@ -13,6 +13,7 @@ from pbx_portal.sources import CdrRepository, FreePbxCdrSource, QueueLogReposito
 
 _sync_lock = threading.Lock()
 _scheduler_started = False
+_scheduler_lock_fd = None
 _sync_meta_lock = threading.Lock()
 _sync_meta = {"running": False, "trigger": None, "actor": None, "started_at": None}
 
@@ -320,9 +321,13 @@ def _start_scheduler_once(app):
     global _scheduler_started
     if _scheduler_started or not _auto_sync_enabled():
         return
+    if not _acquire_scheduler_leader(app):
+        app.logger.info("Background scheduler not started in this worker (leader already elected)")
+        return
     _scheduler_started = True
     thread = threading.Thread(target=_sync_loop, args=(app,), daemon=True)
     thread.start()
+    app.logger.info("Background scheduler started in this worker")
 
 
 def _sync_loop(app):
@@ -415,6 +420,31 @@ def _sync_result_summary(result):
         f"agents_received={agents.get('received', 0)} agents_synced={agents.get('synced', False)} "
         f"partial={result.get('partial', False)}"
     )
+
+
+def _acquire_scheduler_leader(app):
+    path = os.getenv("SYNC_LEADER_LOCK_FILE", "/tmp/pbx-portal-sync-scheduler.lock")
+    try:
+        import fcntl
+    except ImportError:
+        app.logger.warning("fcntl unavailable; scheduler leader lock disabled")
+        return True
+
+    global _scheduler_lock_fd
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as exc:
+        app.logger.warning("Could not open scheduler lock file %s: %s", path, exc)
+        return False
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+
+    _scheduler_lock_fd = fd
+    return True
 
 
 app = create_app()

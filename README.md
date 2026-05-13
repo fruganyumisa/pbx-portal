@@ -83,6 +83,7 @@ SESSION_COOKIE_SAMESITE=Lax
 SESSION_COOKIE_SECURE=false
 TRUST_PROXY=false
 APP_LOG_LEVEL=INFO
+SYNC_LEADER_LOCK_FILE=/tmp/pbx-portal-sync-scheduler.lock
 ```
 
 For TLS-terminated deployments behind Nginx or a load balancer, set:
