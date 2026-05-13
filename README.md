@@ -82,6 +82,7 @@ SESSION_COOKIE_HTTPONLY=true
 SESSION_COOKIE_SAMESITE=Lax
 SESSION_COOKIE_SECURE=false
 TRUST_PROXY=false
+APP_LOG_LEVEL=INFO
 ```
 
 For TLS-terminated deployments behind Nginx or a load balancer, set:
@@ -89,6 +90,18 @@ For TLS-terminated deployments behind Nginx or a load balancer, set:
 ```text
 SESSION_COOKIE_SECURE=true
 TRUST_PROXY=true
+```
+
+To follow backend sync activity in real time:
+
+```bash
+docker compose logs -f backend
+```
+
+Filter only sync-related lines:
+
+```bash
+docker compose logs -f backend | grep -Ei 'sync started|sync completed|sync failed|sync rejected|background sync'
 ```
 
 The portal does not seed demo CDR data. The dashboard remains empty until real PBX records are imported.

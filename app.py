@@ -13,10 +13,13 @@ from pbx_portal.sources import CdrRepository, FreePbxCdrSource, QueueLogReposito
 
 _sync_lock = threading.Lock()
 _scheduler_started = False
+_sync_meta_lock = threading.Lock()
+_sync_meta = {"running": False, "trigger": None, "actor": None, "started_at": None}
 
 
 def create_app():
     app = Flask(__name__)
+    app.logger.setLevel(os.getenv("APP_LOG_LEVEL", "INFO").upper())
     app.secret_key = os.getenv("SECRET_KEY", "change-me-in-production")
     if _env_bool("TRUST_PROXY", False):
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
@@ -189,8 +192,17 @@ def create_app():
         end = _parse_date(request.args.get("end")) or datetime.utcnow()
         explicit_start = _parse_date(request.args.get("start"))
         fallback_start = end - timedelta(days=days or 1)
+        actor = _current_user(auth)
+        actor_name = actor["username"] if actor else "unknown"
         try:
-            result = _run_sync(start=explicit_start, end=end, fallback_start=fallback_start)
+            result = _run_sync(
+                start=explicit_start,
+                end=end,
+                fallback_start=fallback_start,
+                trigger="manual",
+                actor=actor_name,
+                app=app,
+            )
         except RuntimeError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 502
         except Exception:
@@ -263,12 +275,44 @@ def _current_user(auth):
     }
 
 
-def _run_sync(start=None, end=None, fallback_start=None):
+def _run_sync(start=None, end=None, fallback_start=None, trigger="manual", actor="system", app=None):
     if not _sync_lock.acquire(blocking=False):
-        raise RuntimeError("Sync is already running")
+        running = _sync_meta_snapshot()
+        detail = ""
+        if running["running"]:
+            detail = (
+                f" (trigger={running['trigger']}, actor={running['actor']}, "
+                f"started_at={running['started_at']})"
+            )
+        message = f"Sync is already running{detail}"
+        if app:
+            app.logger.warning("Sync rejected: %s", message)
+        raise RuntimeError(message)
+
+    started_at = datetime.utcnow()
+    _set_sync_meta(running=True, trigger=trigger, actor=actor, started_at=started_at.isoformat())
+    if app:
+        app.logger.info(
+            "Sync started: trigger=%s actor=%s requested_start=%s fallback_start=%s end=%s",
+            trigger,
+            actor,
+            _dt_to_iso(start),
+            _dt_to_iso(fallback_start),
+            _dt_to_iso(end),
+        )
     try:
-        return sync_freepbx_to_portal(start=start, end=end, fallback_start=fallback_start)
+        result = sync_freepbx_to_portal(start=start, end=end, fallback_start=fallback_start)
+        if app:
+            elapsed = (datetime.utcnow() - started_at).total_seconds()
+            app.logger.info("Sync completed in %.2fs: %s", elapsed, _sync_result_summary(result))
+        return result
+    except Exception:
+        if app:
+            elapsed = (datetime.utcnow() - started_at).total_seconds()
+            app.logger.exception("Sync failed after %.2fs", elapsed)
+        raise
     finally:
+        _set_sync_meta(running=False, trigger=None, actor=None, started_at=None)
         _sync_lock.release()
 
 
@@ -290,7 +334,13 @@ def _sync_loop(app):
             with app.app_context():
                 end = datetime.utcnow()
                 fallback_start = end - timedelta(days=int(os.getenv("INITIAL_SYNC_DAYS", "1")))
-                _run_sync(end=end, fallback_start=fallback_start)
+                _run_sync(
+                    end=end,
+                    fallback_start=fallback_start,
+                    trigger="background",
+                    actor="scheduler",
+                    app=app,
+                )
         except Exception as exc:
             app.logger.warning("Background sync failed: %s", exc)
         time.sleep(interval)
@@ -331,6 +381,40 @@ def _env_bool(name, default):
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _set_sync_meta(running, trigger, actor, started_at):
+    with _sync_meta_lock:
+        _sync_meta["running"] = running
+        _sync_meta["trigger"] = trigger
+        _sync_meta["actor"] = actor
+        _sync_meta["started_at"] = started_at
+
+
+def _sync_meta_snapshot():
+    with _sync_meta_lock:
+        return {
+            "running": _sync_meta["running"],
+            "trigger": _sync_meta["trigger"],
+            "actor": _sync_meta["actor"],
+            "started_at": _sync_meta["started_at"],
+        }
+
+
+def _dt_to_iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else None
+
+
+def _sync_result_summary(result):
+    calls = result.get("calls") or {}
+    agents = result.get("agents") or {}
+    return (
+        f"window={result.get('start')}..{result.get('end')} "
+        f"calls_received={calls.get('received', 0)} calls_stored={calls.get('stored', 0)} "
+        f"chunks={calls.get('chunks', 0)} "
+        f"agents_received={agents.get('received', 0)} agents_synced={agents.get('synced', False)} "
+        f"partial={result.get('partial', False)}"
+    )
 
 
 app = create_app()
