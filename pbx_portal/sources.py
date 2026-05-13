@@ -2,8 +2,83 @@ import csv
 import hashlib
 import os
 import time
+import threading
 from collections import deque
 from datetime import datetime, timedelta
+
+
+# Global connection pool for FreePBX MySQL connections
+_mysql_pool = None
+_mysql_pool_lock = threading.Lock()
+
+
+class MySQLConnectionPool:
+    """Simple connection pool for FreePBX MySQL connections."""
+    def __init__(self, config, pool_size=5, pool_name="freepbx_pool"):
+        self.config = config
+        self.pool_size = pool_size
+        self.pool_name = pool_name
+        self.available_connections = deque(maxlen=pool_size)
+        self.all_connections = []
+        self.lock = threading.Lock()
+        self._initialize_pool()
+
+    def _initialize_pool(self):
+        """Create initial connections in the pool."""
+        try:
+            import mysql.connector
+        except ImportError:
+            raise RuntimeError("Install mysql-connector-python: pip install mysql-connector-python")
+        
+        for _ in range(self.pool_size):
+            tries = 3
+            while tries > 0:
+                try:
+                    conn = mysql.connector.connect(**self.config)
+                    self.available_connections.append(conn)
+                    self.all_connections.append(conn)
+                    break
+                except Exception:
+                    tries -= 1
+                    if tries == 0:
+                        raise
+
+    def get_connection(self, timeout=10):
+        """Get a connection from the pool with timeout."""
+        start_time = time.time()
+        while True:
+            with self.lock:
+                if self.available_connections:
+                    return self.available_connections.popleft()
+            
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                raise RuntimeError(f"Could not acquire MySQL connection from pool within {timeout}s")
+            time.sleep(0.1)
+
+    def return_connection(self, conn):
+        """Return a connection to the pool."""
+        if conn:
+            try:
+                with self.lock:
+                    self.available_connections.append(conn)
+            except Exception:
+                # Pool is full, close the connection
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def close_all(self):
+        """Close all connections in the pool."""
+        with self.lock:
+            for conn in self.all_connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self.available_connections.clear()
+            self.all_connections.clear()
 
 
 class CdrRepository:
@@ -152,9 +227,12 @@ class FreePbxCdrSource:
         if start >= end:
             return
 
-        limit = max(_env_int("PBX_SYNC_QUERY_LIMIT", 5000), 100)
-        window_minutes = max(_env_int("PBX_SYNC_WINDOW_MINUTES", 60), 1)
+        # Configurable limits with reasonable defaults
+        limit = max(_env_int("PBX_SYNC_QUERY_LIMIT", 1000), 100)  # Reduced from 5000
+        max_rows = max(_env_int("PBX_SYNC_MAX_ROWS", 50000), 1000)  # Hard cap on total rows per window
+        window_minutes = max(_env_int("PBX_SYNC_WINDOW_MINUTES", 30), 1)  # Reduced from 60
         min_window_seconds = max(_env_int("PBX_SYNC_MIN_WINDOW_SECONDS", 60), 1)
+        rate_limit_ms = max(_env_int("PBX_SYNC_RATE_LIMIT_MS", 100), 0)  # Throttle between queries
         end_exclusive = end + timedelta(seconds=1)
 
         windows = deque()
@@ -172,17 +250,34 @@ class FreePbxCdrSource:
                 limit=limit + 1,
                 offset=0,
             )
+            
+            # If within limit, yield all rows
             if len(probe_rows) <= limit:
-                yield [_normalize_cdr(row) for row in probe_rows]
+                if probe_rows:
+                    yield [_normalize_cdr(row) for row in probe_rows]
+                    if rate_limit_ms > 0:
+                        time.sleep(rate_limit_ms / 1000.0)
                 continue
 
-            if (window_end - window_start).total_seconds() > min_window_seconds:
-                midpoint = window_start + ((window_end - window_start) / 2)
-                if window_start < midpoint < window_end:
-                    windows.appendleft((midpoint, window_end))
-                    windows.appendleft((window_start, midpoint))
-                    continue
+            # Check total rows to prevent overwhelming the database
+            if len(probe_rows) > max_rows:
+                # Subdivide the window to reduce row count
+                if (window_end - window_start).total_seconds() > min_window_seconds:
+                    midpoint = window_start + ((window_end - window_start) / 2)
+                    if window_start < midpoint < window_end:
+                        windows.appendleft((midpoint, window_end))
+                        windows.appendleft((window_start, midpoint))
+                        continue
+                else:
+                    # Window too small to subdivide, paginate even though it's large
+                    import warnings
+                    warnings.warn(
+                        f"Large dataset ({len(probe_rows)} rows) in small window "
+                        f"[{window_start} to {window_end}]. May cause timeouts.",
+                        RuntimeWarning
+                    )
 
+            # Paginate through results
             offset = 0
             while True:
                 page_rows = self._fetch_calls_window_rows(
@@ -194,16 +289,13 @@ class FreePbxCdrSource:
                 if not page_rows:
                     break
                 yield [_normalize_cdr(row) for row in page_rows]
+                if rate_limit_ms > 0:
+                    time.sleep(rate_limit_ms / 1000.0)
                 if len(page_rows) < limit:
                     break
                 offset += limit
 
     def _fetch_calls_window_rows(self, start, end_exclusive, limit, offset):
-        try:
-            import pymysql
-        except ImportError as exc:
-            raise RuntimeError("Install PyMySQL to connect to FreePBX: pip install PyMySQL") from exc
-
         sql = """
             SELECT calldate, src, dst, dcontext, channel, dstchannel, disposition,
                    duration, billsec, lastapp, lastdata
@@ -215,10 +307,17 @@ class FreePbxCdrSource:
         """
 
         def _read():
-            with pymysql.connect(**_pbx_mysql_connect_kwargs(pymysql), **self.mysql_config) as conn:
-                with conn.cursor() as cursor:
+            pool = _get_mysql_pool(self.mysql_config)
+            conn = pool.get_connection(timeout=15)
+            try:
+                cursor = conn.cursor()
+                try:
                     cursor.execute(sql, (start, end_exclusive, int(limit), int(offset)))
                     return cursor.fetchall()
+                finally:
+                    cursor.close()
+            finally:
+                pool.return_connection(conn)
 
         return _with_pbx_retry("CDR fetch", _read)
 
@@ -242,21 +341,23 @@ class FreePbxAgentSource:
         if not self.mysql_config:
             raise RuntimeError("FreePBX database settings are not configured")
 
-        try:
-            import pymysql
-        except ImportError as exc:
-            raise RuntimeError("Install PyMySQL to connect to FreePBX: pip install PyMySQL") from exc
-
         sql = """
             SELECT extension, name, voicemail, ringtimer, noanswer, outboundcid
             FROM users
             ORDER BY extension
         """
         def _read():
-            with pymysql.connect(**_pbx_mysql_connect_kwargs(pymysql), **self.mysql_config) as conn:
-                with conn.cursor() as cursor:
+            pool = _get_mysql_pool(self.mysql_config)
+            conn = pool.get_connection(timeout=15)
+            try:
+                cursor = conn.cursor()
+                try:
                     cursor.execute(sql)
                     return cursor.fetchall()
+                finally:
+                    cursor.close()
+            finally:
+                pool.return_connection(conn)
 
         rows = _with_pbx_retry("agent fetch", _read)
 
@@ -797,6 +898,34 @@ def _database_url_from_env():
     return None
 
 
+def _get_mysql_pool(mysql_config):
+    """Get or create the global MySQL connection pool."""
+    global _mysql_pool
+    
+    if _mysql_pool is not None:
+        return _mysql_pool
+    
+    with _mysql_pool_lock:
+        if _mysql_pool is not None:
+            return _mysql_pool
+        
+        pool_size = max(_env_int("PBX_DB_POOL_SIZE", 5), 2)
+        enhanced_config = {**mysql_config, **_pbx_mysql_connect_kwargs()}
+        _mysql_pool = MySQLConnectionPool(enhanced_config, pool_size=pool_size)
+        return _mysql_pool
+
+
+def _pbx_mysql_connect_kwargs():
+    """Get connection kwargs for mysql-connector-python."""
+    return {
+        "connect_timeout": _env_int("PBX_DB_CONNECT_TIMEOUT_SECONDS", 15),
+        "get_warnings": False,
+        "use_pure": True,  # Use pure Python implementation for better compatibility
+        # Note: mysql-connector does not have read_timeout at the connection level,
+        # but individual queries can have timeouts. Consider using connection.query_timeout
+    }
+
+
 def _pbx_mysql_config(database):
     host = os.getenv("PBX_DB_HOST")
     user = os.getenv("PBX_DB_USER")
@@ -810,15 +939,6 @@ def _pbx_mysql_config(database):
         "user": user,
         "password": password,
         "database": database,
-    }
-
-
-def _pbx_mysql_connect_kwargs(pymysql_module):
-    return {
-        "cursorclass": pymysql_module.cursors.DictCursor,
-        "connect_timeout": _env_int("PBX_DB_CONNECT_TIMEOUT_SECONDS", 10),
-        "read_timeout": _env_int("PBX_DB_READ_TIMEOUT_SECONDS", 180),
-        "write_timeout": _env_int("PBX_DB_WRITE_TIMEOUT_SECONDS", 30),
         "charset": "utf8mb4",
         "autocommit": True,
     }
@@ -826,23 +946,32 @@ def _pbx_mysql_connect_kwargs(pymysql_module):
 
 def _with_pbx_retry(operation, fn):
     attempts = max(_env_int("PBX_DB_RETRY_ATTEMPTS", 3), 1)
-    base_delay = max(_env_float("PBX_DB_RETRY_BASE_DELAY_SECONDS", 2.0), 0.0)
+    base_delay = max(_env_float("PBX_DB_RETRY_BASE_DELAY_SECONDS", 1.0), 0.0)
+    max_delay = max(_env_float("PBX_DB_RETRY_MAX_DELAY_SECONDS", 30.0), base_delay)
+    
     try:
-        import pymysql
-    except ImportError as exc:
-        raise RuntimeError("Install PyMySQL to connect to FreePBX: pip install PyMySQL") from exc
+        import mysql.connector
+    except ImportError:
+        raise RuntimeError("Install mysql-connector-python: pip install mysql-connector-python")
 
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except pymysql.MySQLError as exc:
+        except (mysql.connector.Error, TimeoutError, OSError) as exc:
             last_error = exc
             if attempt >= attempts:
                 break
+            
+            # Exponential backoff with jitter and cap
             sleep_for = base_delay * (2 ** (attempt - 1))
+            sleep_for = min(sleep_for, max_delay)
+            
             if sleep_for > 0:
-                time.sleep(sleep_for)
+                import random
+                jitter = random.uniform(0, 0.1 * sleep_for)
+                time.sleep(sleep_for + jitter)
+    
     raise RuntimeError(f"PBX {operation} failed after {attempts} attempts: {last_error}")
 
 

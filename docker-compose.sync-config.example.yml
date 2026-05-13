@@ -1,0 +1,45 @@
+version: '3.8'
+
+# This is an example docker-compose override file showing recommended
+# environment variables for the improved sync system.
+# 
+# To use: Copy this file's environment variables into your docker-compose.yml
+# or create a .env file and reference it with: env_file: .env
+
+services:
+  backend:
+    environment:
+      # Connection Pool Configuration
+      # Reuse MySQL connections to avoid timeout issues
+      PBX_DB_POOL_SIZE: "5"                              # Increase for high concurrency
+      PBX_DB_CONNECT_TIMEOUT_SECONDS: "15"              # Timeout for connection establishment
+
+      # Query and Data Limits
+      # Reduced defaults prevent timeouts on large datasets
+      PBX_SYNC_QUERY_LIMIT: "1000"                      # Max rows per query (reduced from 5000)
+      PBX_SYNC_MAX_ROWS: "50000"                        # Hard cap per time window
+      PBX_SYNC_WINDOW_MINUTES: "30"                     # Time window (reduced from 60)
+      PBX_SYNC_MIN_WINDOW_SECONDS: "60"                 # Minimum subdivision window
+
+      # Rate Limiting
+      # Throttle queries to avoid overwhelming the database
+      PBX_SYNC_RATE_LIMIT_MS: "100"                     # Delay between batch queries (ms)
+
+      # Retry Configuration
+      # Better backoff strategy with exponential delays
+      PBX_DB_RETRY_ATTEMPTS: "3"                        # Number of retries
+      PBX_DB_RETRY_BASE_DELAY_SECONDS: "1.0"           # Base delay (was 2.0)
+      PBX_DB_RETRY_MAX_DELAY_SECONDS: "30.0"           # Cap on retry delay
+
+      # Auto-Sync Configuration
+      AUTO_SYNC_ENABLED: "true"
+      SYNC_INTERVAL_SECONDS: "600"                      # Sync every 10 minutes
+      SYNC_INITIAL_DELAY_SECONDS: "20"
+      INITIAL_SYNC_DAYS: "1"
+
+      # For high-load scenarios, uncomment the below:
+      # PBX_SYNC_QUERY_LIMIT: "500"
+      # PBX_SYNC_WINDOW_MINUTES: "10"
+      # PBX_SYNC_RATE_LIMIT_MS: "500"
+      # PBX_DB_POOL_SIZE: "2"
+      # SYNC_INTERVAL_SECONDS: "900"
