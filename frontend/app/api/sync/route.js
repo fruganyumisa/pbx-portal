@@ -1,13 +1,10 @@
-import { NextResponse } from "next/server";
+import { proxyJson } from "../_utils/proxy";
 
 export async function POST(request) {
-  const backend = process.env.PBX_API_URL || "http://backend:5000";
   const url = new URL(request.url);
-  const response = await fetch(`${backend}/api/sync?${url.searchParams.toString()}`, {
+  return proxyJson({
+    path: `/api/sync?${url.searchParams.toString()}`,
     method: "POST",
-    headers: { cookie: request.headers.get("cookie") || "" },
-    cache: "no-store",
+    cookie: request.headers.get("cookie") || "",
   });
-  const data = await response.json();
-  return NextResponse.json(data, { status: response.status });
 }

@@ -1,23 +1,15 @@
-import { NextResponse } from "next/server";
+import { proxyJson } from "../../_utils/proxy";
 
 async function proxyAuth(request, context, method) {
-  const backend = process.env.PBX_API_URL || "http://backend:5000";
   const path = context.params.path.join("/");
-  const headers = {
-    cookie: request.headers.get("cookie") || "",
-    "content-type": request.headers.get("content-type") || "application/json",
-  };
-  const response = await fetch(`${backend}/api/auth/${path}`, {
+  return proxyJson({
+    path: `/api/auth/${path}`,
     method,
-    headers,
+    cookie: request.headers.get("cookie") || "",
+    contentType: request.headers.get("content-type") || "application/json",
     body: method === "GET" ? undefined : await request.text(),
-    cache: "no-store",
+    forwardSetCookie: true,
   });
-  const data = await response.json();
-  const nextResponse = NextResponse.json(data, { status: response.status });
-  const setCookie = response.headers.get("set-cookie");
-  if (setCookie) nextResponse.headers.set("set-cookie", setCookie);
-  return nextResponse;
 }
 
 export async function GET(request, context) {

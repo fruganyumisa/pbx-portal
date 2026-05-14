@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import logging
 import os
 import time
 import threading
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 # Global connection pools for FreePBX MySQL databases (one per database)
 _mysql_pools = {}  # Dict of database -> pool
 _mysql_pools_lock = threading.Lock()
+LOGGER = logging.getLogger(__name__)
 
 
 class MySQLConnectionPool:
@@ -227,12 +229,10 @@ class FreePbxCdrSource:
         if start >= end:
             return
 
-        # Configurable limits with reasonable defaults
-        limit = max(_env_int("PBX_SYNC_QUERY_LIMIT", 1000), 100)  # Reduced from 5000
-        max_rows = max(_env_int("PBX_SYNC_MAX_ROWS", 50000), 1000)  # Hard cap on total rows per window
-        window_minutes = max(_env_int("PBX_SYNC_WINDOW_MINUTES", 30), 1)  # Reduced from 60
+        limit = max(_env_int("PBX_SYNC_QUERY_LIMIT", 1000), 100)
+        window_minutes = max(_env_int("PBX_SYNC_WINDOW_MINUTES", 30), 1)
         min_window_seconds = max(_env_int("PBX_SYNC_MIN_WINDOW_SECONDS", 60), 1)
-        rate_limit_ms = max(_env_int("PBX_SYNC_RATE_LIMIT_MS", 100), 0)  # Throttle between queries
+        rate_limit_ms = max(_env_int("PBX_SYNC_RATE_LIMIT_MS", 0), 0)
         end_exclusive = end + timedelta(seconds=1)
 
         windows = deque()
@@ -248,10 +248,9 @@ class FreePbxCdrSource:
                 start=window_start,
                 end_exclusive=window_end,
                 limit=limit + 1,
-                offset=0,
+                last_key=None,
             )
-            
-            # If within limit, yield all rows
+
             if len(probe_rows) <= limit:
                 if probe_rows:
                     yield [_normalize_cdr(row) for row in probe_rows]
@@ -259,32 +258,21 @@ class FreePbxCdrSource:
                         time.sleep(rate_limit_ms / 1000.0)
                 continue
 
-            # Check total rows to prevent overwhelming the database
-            if len(probe_rows) > max_rows:
-                # Subdivide the window to reduce row count
-                if (window_end - window_start).total_seconds() > min_window_seconds:
-                    midpoint = window_start + ((window_end - window_start) / 2)
-                    if window_start < midpoint < window_end:
-                        windows.appendleft((midpoint, window_end))
-                        windows.appendleft((window_start, midpoint))
-                        continue
-                else:
-                    # Window too small to subdivide, paginate even though it's large
-                    import warnings
-                    warnings.warn(
-                        f"Large dataset ({len(probe_rows)} rows) in small window "
-                        f"[{window_start} to {window_end}]. May cause timeouts.",
-                        RuntimeWarning
-                    )
+            if (window_end - window_start).total_seconds() > min_window_seconds:
+                midpoint = window_start + ((window_end - window_start) / 2)
+                if window_start < midpoint < window_end:
+                    windows.appendleft((midpoint, window_end))
+                    windows.appendleft((window_start, midpoint))
+                    continue
 
-            # Paginate through results
-            offset = 0
+            # Dense small window: keyset pagination (avoid OFFSET degradation).
+            last_key = None
             while True:
                 page_rows = self._fetch_calls_window_rows(
                     start=window_start,
                     end_exclusive=window_end,
                     limit=limit,
-                    offset=offset,
+                    last_key=last_key,
                 )
                 if not page_rows:
                     break
@@ -293,18 +281,49 @@ class FreePbxCdrSource:
                     time.sleep(rate_limit_ms / 1000.0)
                 if len(page_rows) < limit:
                     break
-                offset += limit
+                last_key = _cdr_sort_key(page_rows[-1])
 
-    def _fetch_calls_window_rows(self, start, end_exclusive, limit, offset):
-        sql = """
+    def _fetch_calls_window_rows(self, start, end_exclusive, limit, last_key=None):
+        where = ["calldate >= %s", "calldate < %s"]
+        params = [start, end_exclusive]
+        if last_key is not None:
+            where.append(
+                """
+                (
+                    calldate > %s OR
+                    (calldate = %s AND src > %s) OR
+                    (calldate = %s AND src = %s AND dst > %s) OR
+                    (calldate = %s AND src = %s AND dst = %s AND channel > %s) OR
+                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel > %s) OR
+                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel = %s AND disposition > %s) OR
+                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel = %s AND disposition = %s AND duration > %s) OR
+                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel = %s AND disposition = %s AND duration = %s AND billsec > %s)
+                )
+                """
+            )
+            params.extend(
+                [
+                    last_key["calldate"],
+                    last_key["calldate"], last_key["src"],
+                    last_key["calldate"], last_key["src"], last_key["dst"],
+                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"],
+                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"],
+                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"], last_key["disposition"],
+                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"], last_key["disposition"], last_key["duration"],
+                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"], last_key["disposition"], last_key["duration"], last_key["billsec"],
+                ]
+            )
+
+        sql = f"""
             SELECT calldate, src, dst, dcontext, channel, dstchannel, disposition,
                    duration, billsec, lastapp, lastdata
             FROM cdr
-            WHERE calldate >= %s AND calldate < %s
+            WHERE {" AND ".join(where)}
             ORDER BY calldate ASC, src ASC, dst ASC, channel ASC, dstchannel ASC,
                      disposition ASC, duration ASC, billsec ASC
-            LIMIT %s OFFSET %s
+            LIMIT %s
         """
+        params.append(int(limit))
 
         def _read():
             pool = _get_mysql_pool(self.mysql_config)
@@ -312,7 +331,7 @@ class FreePbxCdrSource:
             try:
                 cursor = conn.cursor(dictionary=True)
                 try:
-                    cursor.execute(sql, (start, end_exclusive, int(limit), int(offset)))
+                    cursor.execute(sql, tuple(params))
                     return cursor.fetchall()
                 finally:
                     cursor.close()
@@ -519,6 +538,7 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
     if not cdr_start:
         raise RuntimeError("No previous CDR sync exists. Provide start or days for the first sync.")
 
+    sync_started_at = time.time()
     warnings = []
     agent_result = {
         "received": 0,
@@ -547,6 +567,15 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
         call_totals["received"] += chunk_result["received"]
         call_totals["stored"] += chunk_result["stored"]
         call_chunks += 1
+        if call_chunks == 1 or call_chunks % 10 == 0:
+            elapsed = time.time() - sync_started_at
+            LOGGER.info(
+                "Sync progress: chunks=%s calls_received=%s calls_stored=%s elapsed=%.1fs",
+                call_chunks,
+                call_totals["received"],
+                call_totals["stored"],
+                elapsed,
+            )
 
     store.set_sync_timestamp("cdr", end)
     if agent_result["synced"]:
@@ -636,6 +665,22 @@ def _normalize_cdr(row):
         "billsec": billsec,
         "ring_seconds": max(duration - billsec, 0),
         "queue": _queue_from_context(row),
+    }
+
+
+def _cdr_sort_key(row):
+    calldate = row.get("calldate")
+    if isinstance(calldate, str):
+        calldate = datetime.strptime(calldate, "%Y-%m-%d %H:%M:%S")
+    return {
+        "calldate": calldate,
+        "src": str(row.get("src") or ""),
+        "dst": str(row.get("dst") or ""),
+        "channel": str(row.get("channel") or ""),
+        "dstchannel": str(row.get("dstchannel") or ""),
+        "disposition": str(row.get("disposition") or ""),
+        "duration": int(row.get("duration") or 0),
+        "billsec": int(row.get("billsec") or 0),
     }
 
 
