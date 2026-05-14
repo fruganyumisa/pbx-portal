@@ -122,6 +122,28 @@ Then click `Sync PBX` in the dashboard or call:
 curl -X POST 'http://localhost:5000/api/sync?days=1'
 ```
 
+For first deployment bootstrap, you can run a dedicated batch script and then let regular incremental sync continue from the last successful batch:
+
+```bash
+docker compose exec backend python scripts/bootstrap_sync.py \
+  --start=2026-05-13T00:00:00 \
+  --end=2026-05-13T06:00:00 \
+  --batch-minutes=30 \
+  --sleep-seconds=1
+```
+
+Recommended for bootstrap:
+
+```bash
+AUTO_SYNC_ENABLED=false docker compose up -d --force-recreate backend
+```
+
+After bootstrap completes, re-enable background incremental sync:
+
+```bash
+AUTO_SYNC_ENABLED=true docker compose up -d --force-recreate backend
+```
+
 Sync imports both CDR rows and agent records. The portal stores all imported history in Postgres, so old calls remain available for filtering after later syncs.
 
 CDR import is chunked by time window and query limit to handle large datasets without single long-running PBX queries.

@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY pbx_portal ./pbx_portal
+COPY scripts ./scripts
 
 EXPOSE 5000
 
