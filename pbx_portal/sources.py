@@ -27,16 +27,11 @@ class MySQLConnectionPool:
 
     def _initialize_pool(self):
         """Create initial connections in the pool."""
-        try:
-            import mysql.connector
-        except ImportError:
-            raise RuntimeError("Install mysql-connector-python: pip install mysql-connector-python")
-        
         for _ in range(self.pool_size):
             tries = 3
             while tries > 0:
                 try:
-                    conn = mysql.connector.connect(**self.config)
+                    conn = self._new_connection()
                     self.available_connections.append(conn)
                     self.all_connections.append(conn)
                     break
@@ -45,13 +40,29 @@ class MySQLConnectionPool:
                     if tries == 0:
                         raise
 
+    def _new_connection(self):
+        try:
+            import mysql.connector
+        except ImportError:
+            raise RuntimeError("Install mysql-connector-python: pip install mysql-connector-python")
+        return mysql.connector.connect(**self.config)
+
     def get_connection(self, timeout=10):
         """Get a connection from the pool with timeout."""
         start_time = time.time()
         while True:
             with self.lock:
                 if self.available_connections:
-                    return self.available_connections.popleft()
+                    conn = self.available_connections.popleft()
+                    try:
+                        conn.ping(reconnect=True, attempts=1, delay=0)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._new_connection()
+                    return conn
             
             elapsed = time.time() - start_time
             if elapsed > timeout:
@@ -62,10 +73,10 @@ class MySQLConnectionPool:
         """Return a connection to the pool."""
         if conn:
             try:
+                conn.ping(reconnect=False, attempts=1, delay=0)
                 with self.lock:
                     self.available_connections.append(conn)
             except Exception:
-                # Pool is full, close the connection
                 try:
                     conn.close()
                 except Exception:
@@ -527,7 +538,7 @@ class PortalCdrStore:
             conn.commit()
 
 
-def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
+def sync_freepbx_to_portal(start=None, end=None, fallback_start=None, sync_agents=True):
     cdr_source = FreePbxCdrSource.from_env()
     agent_source = FreePbxAgentSource.from_env()
     store = PortalCdrStore.from_env()
@@ -547,17 +558,23 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None):
         "unchanged": 0,
         "synced": False,
     }
-    try:
-        agents = agent_source.fetch_agents()
-        agent_result = {
-            **store.upsert_agents(agents),
-            "synced": True,
-        }
-    except Exception as exc:
-        warnings.append(str(exc))
+    if sync_agents:
+        try:
+            agents = agent_source.fetch_agents()
+            agent_result = {
+                **store.upsert_agents(agents),
+                "synced": True,
+            }
+        except Exception as exc:
+            warnings.append(str(exc))
+            agent_result = {
+                **agent_result,
+                "error": str(exc),
+            }
+    else:
         agent_result = {
             **agent_result,
-            "error": str(exc),
+            "skipped": True,
         }
 
     call_totals = {"received": 0, "stored": 0}
@@ -972,7 +989,7 @@ def _pbx_mysql_connect_kwargs():
         "read_timeout": _env_int("PBX_DB_READ_TIMEOUT_SECONDS", 180),
         "write_timeout": _env_int("PBX_DB_WRITE_TIMEOUT_SECONDS", 30),
         "get_warnings": False,
-        "use_pure": True,  # Use pure Python implementation for better compatibility
+        "use_pure": _env_bool("PBX_DB_USE_PURE", False),
     }
 
 
@@ -1037,6 +1054,13 @@ def _env_float(name, default):
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _nullable_int(value):

@@ -132,6 +132,17 @@ docker compose exec backend python scripts/bootstrap_sync.py \
   --sleep-seconds=1
 ```
 
+If agent sync is timing out but you want to seed CDR first:
+
+```bash
+docker compose exec backend python scripts/bootstrap_sync.py \
+  --start=2026-05-13T00:00:00 \
+  --end=2026-05-13T06:00:00 \
+  --batch-minutes=15 \
+  --sleep-seconds=1 \
+  --skip-agents
+```
+
 Recommended for bootstrap:
 
 ```bash
@@ -218,6 +229,7 @@ export PBX_DB_RETRY_ATTEMPTS=3
 export PBX_DB_RETRY_BASE_DELAY_SECONDS=2
 export PBX_DB_RETRY_MAX_DELAY_SECONDS=30
 export PBX_DB_POOL_SIZE=5
+export PBX_DB_USE_PURE=false
 export PBX_SYNC_QUERY_LIMIT=1000
 export PBX_SYNC_WINDOW_MINUTES=30
 export PBX_SYNC_MIN_WINDOW_SECONDS=60

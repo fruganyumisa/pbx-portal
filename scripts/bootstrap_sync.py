@@ -55,6 +55,11 @@ def main():
         action="store_true",
         help="Continue with next batch on failure instead of exiting immediately",
     )
+    parser.add_argument(
+        "--skip-agents",
+        action="store_true",
+        help="Skip agent sync during bootstrap batches (faster CDR seed)",
+    )
     args = parser.parse_args()
 
     start = _parse_datetime(args.start)
@@ -96,6 +101,7 @@ def main():
                 start=cursor,
                 end=batch_end,
                 fallback_start=cursor,
+                sync_agents=not args.skip_agents,
             )
         except Exception as exc:
             had_error = True
