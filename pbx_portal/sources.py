@@ -562,6 +562,25 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None, sync_agent
 
     sync_started_at = time.time()
     warnings = []
+    call_totals = {"received": 0, "stored": 0}
+    call_chunks = 0
+    for calls_chunk in cdr_source.iter_calls_chunked(start=cdr_start, end=end):
+        chunk_result = store.upsert_calls(calls_chunk)
+        call_totals["received"] += chunk_result["received"]
+        call_totals["stored"] += chunk_result["stored"]
+        call_chunks += 1
+        if call_chunks == 1 or call_chunks % 10 == 0:
+            elapsed = time.time() - sync_started_at
+            LOGGER.info(
+                "Sync progress: chunks=%s calls_received=%s calls_stored=%s elapsed=%.1fs",
+                call_chunks,
+                call_totals["received"],
+                call_totals["stored"],
+                elapsed,
+            )
+
+    store.set_sync_timestamp("cdr", end)
+
     agent_result = {
         "received": 0,
         "inserted": 0,
@@ -588,24 +607,6 @@ def sync_freepbx_to_portal(start=None, end=None, fallback_start=None, sync_agent
             "skipped": True,
         }
 
-    call_totals = {"received": 0, "stored": 0}
-    call_chunks = 0
-    for calls_chunk in cdr_source.iter_calls_chunked(start=cdr_start, end=end):
-        chunk_result = store.upsert_calls(calls_chunk)
-        call_totals["received"] += chunk_result["received"]
-        call_totals["stored"] += chunk_result["stored"]
-        call_chunks += 1
-        if call_chunks == 1 or call_chunks % 10 == 0:
-            elapsed = time.time() - sync_started_at
-            LOGGER.info(
-                "Sync progress: chunks=%s calls_received=%s calls_stored=%s elapsed=%.1fs",
-                call_chunks,
-                call_totals["received"],
-                call_totals["stored"],
-                elapsed,
-            )
-
-    store.set_sync_timestamp("cdr", end)
     if agent_result["synced"]:
         store.set_sync_timestamp("agents", end)
     return {

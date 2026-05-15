@@ -193,6 +193,7 @@ def create_app():
         end = _parse_date(request.args.get("end")) or datetime.utcnow()
         explicit_start = _parse_date(request.args.get("start"))
         fallback_start = end - timedelta(days=days or 1)
+        sync_agents = _parse_bool_arg(request.args.get("sync_agents"), _sync_agents_enabled_by_default())
         actor = _current_user(auth)
         actor_name = actor["username"] if actor else "unknown"
         try:
@@ -200,6 +201,7 @@ def create_app():
                 start=explicit_start,
                 end=end,
                 fallback_start=fallback_start,
+                sync_agents=sync_agents,
                 trigger="manual",
                 actor=actor_name,
                 app=app,
@@ -276,7 +278,7 @@ def _current_user(auth):
     }
 
 
-def _run_sync(start=None, end=None, fallback_start=None, trigger="manual", actor="system", app=None):
+def _run_sync(start=None, end=None, fallback_start=None, sync_agents=True, trigger="manual", actor="system", app=None):
     if not _sync_lock.acquire(blocking=False):
         running = _sync_meta_snapshot()
         detail = ""
@@ -294,15 +296,21 @@ def _run_sync(start=None, end=None, fallback_start=None, trigger="manual", actor
     _set_sync_meta(running=True, trigger=trigger, actor=actor, started_at=started_at.isoformat())
     if app:
         app.logger.info(
-            "Sync started: trigger=%s actor=%s requested_start=%s fallback_start=%s end=%s",
+            "Sync started: trigger=%s actor=%s requested_start=%s fallback_start=%s end=%s sync_agents=%s",
             trigger,
             actor,
             _dt_to_iso(start),
             _dt_to_iso(fallback_start),
             _dt_to_iso(end),
+            sync_agents,
         )
     try:
-        result = sync_freepbx_to_portal(start=start, end=end, fallback_start=fallback_start)
+        result = sync_freepbx_to_portal(
+            start=start,
+            end=end,
+            fallback_start=fallback_start,
+            sync_agents=sync_agents,
+        )
         if app:
             elapsed = (datetime.utcnow() - started_at).total_seconds()
             app.logger.info("Sync completed in %.2fs: %s", elapsed, _sync_result_summary(result))
@@ -342,6 +350,7 @@ def _sync_loop(app):
                 _run_sync(
                     end=end,
                     fallback_start=fallback_start,
+                    sync_agents=_sync_agents_enabled_by_default(),
                     trigger="background",
                     actor="scheduler",
                     app=app,
@@ -353,6 +362,10 @@ def _sync_loop(app):
 
 def _auto_sync_enabled():
     return os.getenv("AUTO_SYNC_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_agents_enabled_by_default():
+    return os.getenv("SYNC_AGENTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
 
 def _parse_date(value):
@@ -410,15 +423,31 @@ def _dt_to_iso(value):
     return value.isoformat() if hasattr(value, "isoformat") else None
 
 
+def _parse_bool_arg(raw_value, default):
+    if raw_value is None:
+        return default
+    value = str(raw_value).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _sync_result_summary(result):
     calls = result.get("calls") or {}
     agents = result.get("agents") or {}
+    warnings = result.get("warnings") or []
+    first_warning = str(warnings[0]).replace("\n", " ").strip() if warnings else ""
+    if len(first_warning) > 180:
+        first_warning = first_warning[:177] + "..."
     return (
         f"window={result.get('start')}..{result.get('end')} "
         f"calls_received={calls.get('received', 0)} calls_stored={calls.get('stored', 0)} "
         f"chunks={calls.get('chunks', 0)} "
         f"agents_received={agents.get('received', 0)} agents_synced={agents.get('synced', False)} "
-        f"partial={result.get('partial', False)}"
+        f"partial={result.get('partial', False)} warnings={len(warnings)} "
+        f"first_warning={first_warning or 'none'}"
     )
 
 

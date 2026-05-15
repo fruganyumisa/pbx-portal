@@ -122,6 +122,12 @@ Then click `Sync PBX` in the dashboard or call:
 curl -X POST 'http://localhost:5000/api/sync?days=1'
 ```
 
+To run a quick CDR-only sync (skip agent refresh in that request):
+
+```bash
+curl -X POST 'http://localhost:5000/api/sync?days=1&sync_agents=false'
+```
+
 For first deployment bootstrap, you can run a dedicated batch script and then let regular incremental sync continue from the last successful batch:
 
 ```bash
@@ -147,6 +153,12 @@ Recommended for bootstrap:
 
 ```bash
 AUTO_SYNC_ENABLED=false docker compose up -d --force-recreate backend
+```
+
+If PBX `users` reads are unstable on your network, you can disable agent sync by default and run agents only when needed:
+
+```bash
+SYNC_AGENTS_ENABLED=false docker compose up -d --force-recreate backend
 ```
 
 After bootstrap completes, re-enable background incremental sync:
@@ -236,6 +248,7 @@ export PBX_SYNC_WINDOW_MINUTES=30
 export PBX_SYNC_MIN_WINDOW_SECONDS=60
 export PBX_SYNC_RATE_LIMIT_MS=0
 export QUEUE_LOG_PATH=/var/log/asterisk/queue_log
+export SYNC_AGENTS_ENABLED=true
 ```
 
 `POSTGRES_*` points to the portal Postgres database. `DATABASE_URL` can override those settings. `PBX_DB_*` points to the FreePBX CDR database, and `PBX_CONFIG_DB_NAME` points to the FreePBX configuration database containing `users`.
