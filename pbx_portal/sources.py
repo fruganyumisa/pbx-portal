@@ -20,7 +20,7 @@ class MySQLConnectionPool:
         self.config = config
         self.pool_size = pool_size
         self.pool_name = pool_name
-        self.available_connections = deque(maxlen=pool_size)
+        self.available_connections = deque()
         self.all_connections = []
         self.lock = threading.Lock()
         self._initialize_pool()
@@ -47,6 +47,16 @@ class MySQLConnectionPool:
             raise RuntimeError("Install mysql-connector-python: pip install mysql-connector-python")
         return mysql.connector.connect(**self.config)
 
+    def _discard_connection(self, conn):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            self.all_connections.remove(conn)
+        except ValueError:
+            pass
+
     def get_connection(self, timeout=10):
         """Get a connection from the pool with timeout."""
         start_time = time.time()
@@ -54,15 +64,20 @@ class MySQLConnectionPool:
             with self.lock:
                 if self.available_connections:
                     conn = self.available_connections.popleft()
-                    try:
-                        conn.ping(reconnect=True, attempts=1, delay=0)
-                    except Exception:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        conn = self._new_connection()
+                elif len(self.all_connections) < self.pool_size:
+                    conn = self._new_connection()
+                    self.all_connections.append(conn)
+                else:
+                    conn = None
+
+            if conn is not None:
+                try:
+                    conn.ping(reconnect=True, attempts=1, delay=0)
                     return conn
+                except Exception:
+                    with self.lock:
+                        self._discard_connection(conn)
+                    continue
             
             elapsed = time.time() - start_time
             if elapsed > timeout:
@@ -75,12 +90,20 @@ class MySQLConnectionPool:
             try:
                 conn.ping(reconnect=False, attempts=1, delay=0)
                 with self.lock:
-                    self.available_connections.append(conn)
+                    if len(self.available_connections) < self.pool_size:
+                        self.available_connections.append(conn)
+                    else:
+                        self._discard_connection(conn)
             except Exception:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                with self.lock:
+                    self._discard_connection(conn)
+                    if len(self.all_connections) < self.pool_size:
+                        try:
+                            replacement = self._new_connection()
+                            self.all_connections.append(replacement)
+                            self.available_connections.append(replacement)
+                        except Exception:
+                            pass
 
     def close_all(self):
         """Close all connections in the pool."""
@@ -338,7 +361,7 @@ class FreePbxCdrSource:
 
         def _read():
             pool = _get_mysql_pool(self.mysql_config)
-            conn = pool.get_connection(timeout=15)
+            conn = pool.get_connection(timeout=_env_int("PBX_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", 30))
             try:
                 cursor = conn.cursor(dictionary=True)
                 try:
@@ -378,7 +401,7 @@ class FreePbxAgentSource:
         """
         def _read():
             pool = _get_mysql_pool(self.mysql_config)
-            conn = pool.get_connection(timeout=15)
+            conn = pool.get_connection(timeout=_env_int("PBX_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", 30))
             try:
                 cursor = conn.cursor(dictionary=True)
                 try:
