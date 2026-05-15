@@ -969,10 +969,10 @@ def _pbx_mysql_connect_kwargs():
     """Get connection kwargs for mysql-connector-python."""
     return {
         "connect_timeout": _env_int("PBX_DB_CONNECT_TIMEOUT_SECONDS", 15),
+        "read_timeout": _env_int("PBX_DB_READ_TIMEOUT_SECONDS", 180),
+        "write_timeout": _env_int("PBX_DB_WRITE_TIMEOUT_SECONDS", 30),
         "get_warnings": False,
         "use_pure": True,  # Use pure Python implementation for better compatibility
-        # Note: mysql-connector does not have read_timeout at the connection level,
-        # but individual queries can have timeouts. Consider using connection.query_timeout
     }
 
 
