@@ -325,36 +325,24 @@ class FreePbxCdrSource:
                 """
                 (
                     calldate > %s OR
-                    (calldate = %s AND src > %s) OR
-                    (calldate = %s AND src = %s AND dst > %s) OR
-                    (calldate = %s AND src = %s AND dst = %s AND channel > %s) OR
-                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel > %s) OR
-                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel = %s AND disposition > %s) OR
-                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel = %s AND disposition = %s AND duration > %s) OR
-                    (calldate = %s AND src = %s AND dst = %s AND channel = %s AND dstchannel = %s AND disposition = %s AND duration = %s AND billsec > %s)
+                    (calldate = %s AND uniqueid > %s)
                 )
                 """
             )
             params.extend(
                 [
                     last_key["calldate"],
-                    last_key["calldate"], last_key["src"],
-                    last_key["calldate"], last_key["src"], last_key["dst"],
-                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"],
-                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"],
-                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"], last_key["disposition"],
-                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"], last_key["disposition"], last_key["duration"],
-                    last_key["calldate"], last_key["src"], last_key["dst"], last_key["channel"], last_key["dstchannel"], last_key["disposition"], last_key["duration"], last_key["billsec"],
+                    last_key["calldate"],
+                    last_key["uniqueid"],
                 ]
             )
 
         sql = f"""
             SELECT calldate, src, dst, dcontext, channel, dstchannel, disposition,
-                   duration, billsec, lastapp, lastdata
+                   duration, billsec, lastapp, lastdata, uniqueid
             FROM cdr
             WHERE {" AND ".join(where)}
-            ORDER BY calldate ASC, src ASC, dst ASC, channel ASC, dstchannel ASC,
-                     disposition ASC, duration ASC, billsec ASC
+            ORDER BY calldate ASC, uniqueid ASC
             LIMIT %s
         """
         params.append(int(limit))
@@ -714,13 +702,7 @@ def _cdr_sort_key(row):
         calldate = datetime.strptime(calldate, "%Y-%m-%d %H:%M:%S")
     return {
         "calldate": calldate,
-        "src": str(row.get("src") or ""),
-        "dst": str(row.get("dst") or ""),
-        "channel": str(row.get("channel") or ""),
-        "dstchannel": str(row.get("dstchannel") or ""),
-        "disposition": str(row.get("disposition") or ""),
-        "duration": int(row.get("duration") or 0),
-        "billsec": int(row.get("billsec") or 0),
+        "uniqueid": str(row.get("uniqueid") or ""),
     }
 
 
